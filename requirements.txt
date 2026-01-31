@@ -1,0 +1,4 @@
+langchain==1.2.7
+gradio==6.4.0
+langchain-groq
+python-dotenv

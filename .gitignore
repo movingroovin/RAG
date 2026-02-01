@@ -1,4 +1,9 @@
 .env
 .vscode/
+.DS_Store
+
+chroma_db/
+docs/
+upload/
 
 DEVELOPMENT_LOG.md

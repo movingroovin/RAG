@@ -17,3 +17,12 @@ response = client.models.generate_content(
 print(f"Time taken: {time.time() - start} seconds")
 
 print(response.text)
+
+print("\nGenerating embeddings...")
+texts = [f"text {i}" for i in range(20)]
+result = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=texts
+)
+
+print(result.embeddings)

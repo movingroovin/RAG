@@ -19,62 +19,76 @@ load_dotenv()
 # 初始化本地嵌入模型 (FastEmbed)
 embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
 
-# 初始化向量資料庫 路徑
-DB_PATH = "./chroma_db"
-UPLOAD_DIR = "./upload"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# 專案管理 路徑
+PROJECTS_DIR = "./projects"
+os.makedirs(PROJECTS_DIR, exist_ok=True)
 
-vectorstore = Chroma(persist_directory=DB_PATH, embedding_function=embeddings)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+def get_project_paths(project_name):
+    if not project_name:
+        return None, None
+    project_path = os.path.join(PROJECTS_DIR, project_name)
+    upload_dir = os.path.join(project_path, "upload")
+    db_path = os.path.join(project_path, "chroma_db")
+    os.makedirs(upload_dir, exist_ok=True)
+    os.makedirs(db_path, exist_ok=True)
+    return upload_dir, db_path
 
-def list_indexed_files():
+def list_projects():
+    if not os.path.exists(PROJECTS_DIR):
+        return []
+    return sorted([d for d in os.listdir(PROJECTS_DIR) if os.path.isdir(os.path.join(PROJECTS_DIR, d))])
+
+def list_indexed_files(project_name):
     """
-    從向量資料庫中獲取已索引的文件列表
+    從指定專案的向量資料庫中獲取已索引的文件列表
     """
+    if not project_name:
+        return "請先選擇或建立專案", []
+    
     try:
+        _, db_path = get_project_paths(project_name)
+        vectorstore = Chroma(persist_directory=db_path, embedding_function=embeddings)
         data = vectorstore.get()
         if not data or not data['metadatas']:
-            return "目前知識庫為空", []
+            return "目前專案知識庫為空", []
         
         sources = set()
         for meta in data['metadatas']:
             if 'source' in meta:
-                # 儲存完整路徑以便後續刪除，但顯示時只顯示檔名
                 sources.add(meta['source'])
         
         if not sources:
-            return "目前知識庫中無文件來源", []
+            return "目前專案中無文件來源", []
         
-        # 建立顯示文字
         display_text = "\n".join([f"📄 {os.path.basename(s)}" for s in sorted(list(sources))])
-        # 回傳顯示文字與原始路徑清單（用於下拉選單）
         return display_text, sorted(list(sources))
     except Exception as e:
         return f"無法讀取清單: {str(e)}", []
 
-def delete_file(file_path):
+def delete_file(file_path, project_name):
     """
-    從向量資料庫中刪除指定文件
+    從指定專案的向量資料庫中刪除指定文件
     """
+    if not project_name:
+        return "請先選擇專案", "請先選擇專案", []
     if not file_path:
-        return "請先選擇要刪除的文件", *list_indexed_files()
+        return "請先選擇要刪除的文件", *list_indexed_files(project_name)
     
     try:
-        # Chroma 可以透過 metadata 進行過濾刪除
+        _, db_path = get_project_paths(project_name)
+        vectorstore = Chroma(persist_directory=db_path, embedding_function=embeddings)
         vectorstore.delete(where={"source": file_path})
         
-        # 同時刪除本地 upload 資料夾中的檔案
         if os.path.exists(file_path):
             os.remove(file_path)
         
         filename = os.path.basename(file_path)
-        status = f"已成功從知識庫與資料夾中刪除文件：{filename}"
+        status = f"已成功從專案「{project_name}」中刪除文件：{filename}"
         
-        # 獲取更新後的清單
-        display_text, file_list = list_indexed_files()
+        display_text, file_list = list_indexed_files(project_name)
         return status, display_text, gr.update(choices=file_list, value=None)
     except Exception as e:
-        return f"刪除失敗: {str(e)}", *list_indexed_files()
+        return f"刪除失敗: {str(e)}", *list_indexed_files(project_name)
 
 def get_groq_models():
     """
@@ -112,50 +126,56 @@ def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
         store[session_id] = InMemoryChatMessageHistory()
     return store[session_id]
 
-def process_files(files):
+def process_files(files, project_name):
     """
-    處理上傳的文件，儲存至 upload 資料夾，並加入向量資料庫
+    處理上傳的文件，儲存至專案目錄下的 upload 資料夾，並加入該專案的向量資料庫
     """
+    if not project_name:
+        return "請先選擇或建立專案", "", gr.update()
     if not files:
-        return "未選擇任何檔案"
+        return "未選擇任何檔案", *list_indexed_files(project_name)
     
+    upload_dir, db_path = get_project_paths(project_name)
     documents = []
-    saved_files = []
     
     for file in files:
-        # 取得檔名並儲存到指定的 upload 資料夾
         filename = os.path.basename(file.name)
-        dest_path = os.path.join(UPLOAD_DIR, filename)
+        dest_path = os.path.join(upload_dir, filename)
         shutil.copy(file.name, dest_path)
-        saved_files.append(dest_path)
         
-        file_path = dest_path
-        if file_path.endswith('.pdf'):
-            loader = PyPDFLoader(file_path)
+        if dest_path.endswith('.pdf'):
+            loader = PyPDFLoader(dest_path)
             documents.extend(loader.load())
-        elif file_path.endswith('.txt') or file_path.endswith('.md'):
-            loader = TextLoader(file_path)
+        elif dest_path.endswith('.txt') or dest_path.endswith('.md'):
+            loader = TextLoader(dest_path)
             documents.extend(loader.load())
     
     if not documents:
-        return "沒有找到可讀取的內容"
+        return "沒有找到可讀取的內容", *list_indexed_files(project_name)
 
     # 切分文本
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = text_splitter.split_documents(documents)
-    print(f"切分為 {len(splits)} 個區塊")
     
-    # 加入向量資料庫
+    # 初始化並加入該專案的向量資料庫
+    vectorstore = Chroma(persist_directory=db_path, embedding_function=embeddings)
     vectorstore.add_documents(documents=splits)
     
-    display_text, file_list = list_indexed_files()
-    return f"成功處理 {len(files)} 個檔案，切分為 {len(splits)} 個區塊並已加入知識庫。", display_text, gr.update(choices=file_list)
+    status = f"成功處理 {len(files)} 個檔案，並已加入專案「{project_name}」知識庫。"
+    display_text, file_list = list_indexed_files(project_name)
+    return status, display_text, gr.update(choices=file_list)
 
-def chat_response(message, history, model_name, use_rag):
+def chat_response(message, history, model_name, use_rag, project_name):
     """
     處理用戶訊息並返回 AI 回應
     """
     try:
+        if use_rag and not project_name:
+            error_msg = "請先選擇專案以使用 RAG 功能"
+            history.append({"role": "user", "content": message})
+            history.append({"role": "assistant", "content": error_msg})
+            return "", history
+
         # 依照選擇的模型動態初始化 LLM
         llm = ChatGroq(
             model=model_name,
@@ -170,6 +190,11 @@ def chat_response(message, history, model_name, use_rag):
                 MessagesPlaceholder(variable_name="history"),
                 ("human", "{input}")
             ])
+            
+            # 建立針對該專案的檢索器
+            _, db_path = get_project_paths(project_name)
+            vectorstore = Chroma(persist_directory=db_path, embedding_function=embeddings)
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
             
             # 檢索相關內容
             docs = retriever.invoke(message)
@@ -231,20 +256,50 @@ def clear_history():
         store["default"] = InMemoryChatMessageHistory()
     return []
 
-# 取得可用模型和初始文件清單
-available_models = get_groq_models()
-initial_indexed_text, initial_file_list = list_indexed_files()
+def create_project(new_name):
+    if not new_name:
+        return "專案名稱不能為空", gr.update(), ""
+    
+    existing_projects = list_projects()
+    if new_name in existing_projects:
+        return f"專案「{new_name}」已存在", gr.update(), ""
+    
+    # 建立專案目錄
+    get_project_paths(new_name)
+    updated_projects = list_projects()
+    return f"成功建立專案：{new_name}", gr.update(choices=updated_projects, value=new_name), ""
 
-# 設定預設模型邏輯：優先使用 "openai/gpt-oss-120b"，若不在清單中則選第一個
+def on_project_change(project_name):
+    display_text, file_list = list_indexed_files(project_name)
+    return display_text, gr.update(choices=file_list, value=None), f"已切換至專案：{project_name}" if project_name else "請選擇專案"
+
+# 取得可用模型和初始專案清單
+available_models = get_groq_models()
+available_projects = list_projects()
+
+# 設定預設模型邏輯
 default_model = "openai/gpt-oss-120b"
 if available_models and default_model not in available_models:
     default_model = available_models[0]
 
 # 創建 Gradio 介面
 with gr.Blocks(title="LangChain + Gradio RAG 應用", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🤖 LangChain + Groq RAG 應用")
+    gr.Markdown("# 🤖 LangChain + Groq 多專案 RAG 應用")
     
     with gr.Sidebar():
+        gr.Markdown("## 📁 專案管理")
+        project_selector = gr.Dropdown(
+            label="選擇現有專案",
+            choices=available_projects,
+            value=available_projects[0] if available_projects else None,
+            interactive=True
+        )
+        
+        with gr.Row():
+            new_project_input = gr.Textbox(label="新專案名稱", placeholder="輸入專案名稱...", scale=2)
+            create_project_btn = gr.Button("新增", scale=1)
+        
+        gr.Markdown("---")
         gr.Markdown("## 📚 知識庫設定")
         rag_toggle = gr.Checkbox(label="啟用 RAG 功能", value=False)
         
@@ -259,15 +314,15 @@ with gr.Blocks(title="LangChain + Gradio RAG 應用", theme=gr.themes.Soft()) as
         with gr.Tab("管理文件"):
             file_to_delete = gr.Dropdown(
                 label="選擇要刪除的文件",
-                choices=initial_file_list,
+                choices=[],
                 interactive=True
             )
             delete_btn = gr.Button("刪除選定文件", variant="stop")
             
-        upload_status = gr.Textbox(label="處理狀態", interactive=False)
+        upload_status = gr.Textbox(label="狀態訊息", interactive=False)
         
-        gr.Markdown("### 📂 目前知識庫內容")
-        indexed_files_display = gr.Markdown(initial_indexed_text)
+        gr.Markdown("### 📂 目前專案文件")
+        indexed_files_display = gr.Markdown("請先選擇專案")
         
         gr.Markdown("---")
         gr.Markdown("### 模型設定")
@@ -297,25 +352,44 @@ with gr.Blocks(title="LangChain + Gradio RAG 應用", theme=gr.themes.Soft()) as
 
     gr.Markdown("---")
     gr.Markdown("**使用說明：**")
-    gr.Markdown("- 若要使用 RAG，請先在左側上傳文件並點擊「更新知識庫」，然後勾選「啟用 RAG 功能」")
-    gr.Markdown("- 在左側下拉選單選擇您想使用的 Groq 模型")
-    gr.Markdown("- 請確保已設定有效的 Groq 與 Google API 金鑰")
+    gr.Markdown("1. **選擇專案**：從左側下拉選單選擇現有專案，或輸入名稱並點選「新增」來建立新專案。")
+    gr.Markdown("2. **上傳文件**：在該專案下上傳 PDF/TXT/MD 檔，並點擊「更新知識庫」。")
+    gr.Markdown("3. **開啟 RAG**：勾選「啟用 RAG 功能」即可開始針對該專案內容進行問答。")
+
+    # 初始化顯示
+    demo.load(
+        on_project_change,
+        inputs=[project_selector],
+        outputs=[indexed_files_display, file_to_delete, upload_status]
+    )
 
     # 設定事件處理
+    project_selector.change(
+        on_project_change,
+        inputs=[project_selector],
+        outputs=[indexed_files_display, file_to_delete, upload_status]
+    )
+
+    create_project_btn.click(
+        create_project,
+        inputs=[new_project_input],
+        outputs=[upload_status, project_selector, new_project_input]
+    )
+
     process_btn.click(
         process_files, 
-        inputs=[file_upload], 
+        inputs=[file_upload, project_selector], 
         outputs=[upload_status, indexed_files_display, file_to_delete]
     )
 
     delete_btn.click(
         delete_file,
-        inputs=[file_to_delete],
+        inputs=[file_to_delete, project_selector],
         outputs=[upload_status, indexed_files_display, file_to_delete]
     )
     
-    msg.submit(chat_response, [msg, chatbot, model_selector, rag_toggle], [msg, chatbot])
-    submit_btn.click(chat_response, [msg, chatbot, model_selector, rag_toggle], [msg, chatbot])
+    msg.submit(chat_response, [msg, chatbot, model_selector, rag_toggle, project_selector], [msg, chatbot])
+    submit_btn.click(chat_response, [msg, chatbot, model_selector, rag_toggle, project_selector], [msg, chatbot])
     clear_btn.click(clear_history, outputs=chatbot)
 
 if __name__ == "__main__":
